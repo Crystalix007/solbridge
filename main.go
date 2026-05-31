@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
@@ -24,14 +25,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
 func main() {
 	sshHost := flag.String("host", "", "iDRAC SSH host (resolved from ~/.ssh/config)")
 	identityFile := flag.String("i", "", "SSH identity file")
 	userFlag := flag.String("u", "root", "SSH user")
+	solCmd := flag.String("cmd", "console com2", "iDRAC console command")
 	flag.Parse()
 
 	if *sshHost == "" || *identityFile == "" {
@@ -47,23 +47,8 @@ func main() {
 	listenAddr := flag.Arg(0)
 
 	keyPath := expandPath(*identityFile)
-	key, err := os.ReadFile(keyPath)
-	if err != nil {
-		log.Fatalf("read key %s: %v", keyPath, err)
-	}
-	signer, err := ssh.ParsePrivateKey(key)
-	if err != nil {
-		log.Fatalf("parse key: %v", err)
-	}
 
-	sshConfig := &ssh.ClientConfig{
-		User:            *userFlag,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-	}
-
-	// Resolve the host from ~/.ssh/config.
+	// Resolve the host from ~/.ssh/config (purely for display + for ssh binary).
 	finalHost, finalPort := resolveSSHConfig(*sshHost)
 	addr := fmt.Sprintf("%s:%d", finalHost, finalPort)
 	log.Printf("connecting to iDRAC at %s (%s)", *sshHost, addr)
@@ -96,13 +81,12 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		b.reconnectLoop(addr, sshConfig)
+		b.reconnectLoop(*sshHost, *userFlag, keyPath, *solCmd)
 	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Listener closed — wait for reconnect loop to clean up, then exit.
 			wg.Wait()
 			break
 		}
@@ -112,7 +96,6 @@ func main() {
 		b.writers = append(b.writers, conn)
 		b.mu.Unlock()
 
-		// Read from TCP client → write to SOL stdin (swappable across reconnects).
 		go func(c net.Conn) {
 			defer c.Close()
 			io.Copy(&b.solIn, c)
@@ -140,7 +123,7 @@ type bridge struct {
 	quit    chan struct{}
 
 	shutdownMu sync.Mutex
-	shutdown   shutdownFunc // set by reconnectLoop, nil when not connected
+	shutdown   shutdownFunc
 }
 
 func (b *bridge) forceClose() {
@@ -194,55 +177,51 @@ func (b *bridge) broadcastMsg(msg string) {
 	}
 }
 
-// connectSOL dials SSH, creates a session, requests a PTY, starts
-// "console com2", and returns the stdin/stdout pipes and a shutdown
-// function that closes the session then the client.
-func connectSOL(addr string, sshConfig *ssh.ClientConfig) (shutdown func(), solIn io.WriteCloser, solOut io.Reader, err error) {
-	client, err := ssh.Dial("tcp", addr, sshConfig)
+// connectSOL spawns ssh to run "console com2" on the iDRAC and returns
+// pipes for bidirectional I/O. Uses the system ssh binary because Go's
+// SSH library doesn't handle iDRAC's exec channel quirks.
+func connectSOL(host, user, keyPath, solCmd string) (shutdown func(), solIn io.WriteCloser, solOut io.Reader, err error) {
+	_, port := resolveSSHConfig(host)
+	target := host
+	if port != 22 {
+		target = fmt.Sprintf("%s:%d", host, port)
+	}
+
+	cmd := exec.Command("ssh",
+		"-T",
+		"-o", "ConnectTimeout=5",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "BatchMode=yes",
+		"-i", keyPath,
+		user+"@"+target,
+		solCmd,
+	)
+
+	cmd.Stderr = os.Stderr // ssh warnings go to our stderr
+
+	solIn, err = cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("ssh dial: %w", err)
+		return nil, nil, nil, fmt.Errorf("ssh stdin: %w", err)
 	}
-
-	session, err := client.NewSession()
+	solOut, err = cmd.StdoutPipe()
 	if err != nil {
-		client.Close()
-		return nil, nil, nil, fmt.Errorf("new session: %w", err)
+		return nil, nil, nil, fmt.Errorf("ssh stdout: %w", err)
 	}
 
-	modes := ssh.TerminalModes{
-		ssh.ECHO:  1,
-		ssh.IGNCR: 1,
-	}
-	if err := session.RequestPty("vt100", 80, 40, modes); err != nil {
-		session.Close()
-		client.Close()
-		return nil, nil, nil, fmt.Errorf("request pty: %w", err)
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, fmt.Errorf("ssh start: %w", err)
 	}
 
-	if solIn, err = session.StdinPipe(); err != nil {
-		session.Close()
-		client.Close()
-		return nil, nil, nil, fmt.Errorf("stdin pipe: %w", err)
+	shutdown = func() {
+		cmd.Process.Signal(syscall.SIGTERM)
+		cmd.Wait()
 	}
-	if solOut, err = session.StdoutPipe(); err != nil {
-		session.Close()
-		client.Close()
-		return nil, nil, nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-
-	if err := session.Start("console com2"); err != nil {
-		session.Close()
-		client.Close()
-		return nil, nil, nil, fmt.Errorf("start console com2: %w", err)
-	}
-
-	shutdown = func() { session.Close(); client.Close() }
 	return shutdown, solIn, solOut, nil
 }
 
 // reconnectLoop dials iDRAC in a loop with exponential backoff, swapping
 // the solIn writer and reading SOL output while connected.
-func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
+func (b *bridge) reconnectLoop(host, user, keyPath, solCmd string) {
 	const minBackoff = 2 * time.Second
 	const maxBackoff = 30 * time.Second
 	delay := minBackoff
@@ -255,7 +234,7 @@ func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
 		default:
 		}
 
-		shutdown, solIn, solOut, err := connectSOL(addr, sshConfig)
+		shutdown, solIn, solOut, err := connectSOL(host, user, keyPath, solCmd)
 		if err != nil {
 			log.Printf("SOL connect failed: %v (retry in %v)", err, delay)
 			sleepUntil(b.quit, delay)
@@ -273,8 +252,6 @@ func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
 		connectedAt := time.Now()
 		b.readSOL(solOut)
 
-		// Only reset backoff if the connection lasted a decent while.
-		// Quick drops (e.g. iDRAC "already in use") should keep backing off.
 		if time.Since(connectedAt) > 10*time.Second {
 			delay = minBackoff
 		} else {
@@ -285,7 +262,8 @@ func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
 		}
 
 		b.broadcastMsg("\r\n--- RECONNECTING ---\r\n")
-		b.setShutdown(nil); shutdown()
+		b.setShutdown(nil)
+		shutdown()
 
 		log.Printf("reconnecting in %v", delay)
 		sleepUntil(b.quit, delay)
@@ -312,7 +290,17 @@ func (sw *swappableWriter) Swap(w io.Writer) {
 	sw.w = w
 }
 
-// --- helpers (unchanged) ---
+// sleepUntil sleeps for d or until quit is closed, whichever comes first.
+func sleepUntil(quit <-chan struct{}, d time.Duration) {
+	timer := time.NewTimer(d)
+	select {
+	case <-quit:
+		timer.Stop()
+	case <-timer.C:
+	}
+}
+
+// --- SSH config helpers ---
 
 func expandPath(p string) string {
 	if len(p) >= 2 && p[:2] == "~/" {
@@ -343,7 +331,6 @@ func resolveSSHConfig(host string) (string, int) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Very simple parser — good enough for ~/.ssh/config.
 		trimmed := strings.TrimLeft(line, " \t")
 		if len(trimmed) >= 5 && strings.EqualFold(trimmed[:5], "Host ") {
 			inHost = false
@@ -377,14 +364,4 @@ func sshKV(s string) (string, string) {
 		return s, ""
 	}
 	return s[:i], strings.TrimLeft(s[i+1:], " \t=")
-}
-
-// sleepUntil sleeps for d or until quit is closed, whichever comes first.
-func sleepUntil(quit <-chan struct{}, d time.Duration) {
-	timer := time.NewTimer(d)
-	select {
-	case <-quit:
-		timer.Stop()
-	case <-timer.C:
-	}
 }
