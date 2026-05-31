@@ -11,7 +11,7 @@ go build -o solbridge .
 ## Usage
 
 ```bash
-./solbridge -host blade.local -i ~/.ssh/blade.local localhost:9119
+./solbridge -host idrac.local -i ~/.ssh/idrac localhost:9119
 ```
 
 Then connect with any TCP client:
@@ -24,10 +24,10 @@ Multiple clients share the same SOL session — output is broadcast, input is se
 
 ### Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-host` | `blade.local` | iDRAC SSH host (resolved from `~/.ssh/config`) |
-| `-i` | `~/.ssh/blade.local` | SSH identity file |
+| Flag | Required | Description |
+|------|----------|-------------|
+| `-host` | yes | iDRAC SSH host (resolved from `~/.ssh/config`) |
+| `-i` | yes | SSH identity file |
 | `-u` | `root` | SSH user |
 
 The listen address is a positional argument (e.g. `localhost:9119` or `:2300`).

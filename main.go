@@ -1,7 +1,7 @@
 // solbridge: SSH into iDRAC, run `console com2`, bridge to local TCP port.
 //
-// Usage: go run . localhost:2300   (listens on 2300, connects to blade.local)
-//        go run . -host blade2.local :2301
+// Usage: go run . -host <idrac> -i <key> localhost:2300
+//        go run . -host <idrac> -i <key> :2301
 //
 // Once running, `nc localhost 2300` connects you to the serial console.
 // Multiple concurrent nc sessions share the same SOL connection (output is broadcast).
@@ -28,14 +28,19 @@ import (
 )
 
 func main() {
-	sshHost := flag.String("host", "blade.local", "iDRAC SSH host (must be in ~/.ssh/config)")
-	identityFile := flag.String("i", "~/.ssh/blade.local", "SSH identity file")
+	sshHost := flag.String("host", "", "iDRAC SSH host (resolved from ~/.ssh/config)")
+	identityFile := flag.String("i", "", "SSH identity file")
 	userFlag := flag.String("u", "root", "SSH user")
 	flag.Parse()
 
+	if *sshHost == "" || *identityFile == "" {
+		fmt.Fprintf(os.Stderr, "Usage: solbridge -host HOST -i IDENTITY [-u USER] LISTEN_ADDR\n")
+		fmt.Fprintf(os.Stderr, "Example: solbridge -host idrac.local -i ~/.ssh/idrac localhost:9119\n")
+		os.Exit(1)
+	}
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: solbridge [-host HOST] [-i IDENTITY] [-u USER] LISTEN_ADDR\n")
-		fmt.Fprintf(os.Stderr, "Example: solbridge localhost:2300\n")
+		fmt.Fprintf(os.Stderr, "Usage: solbridge -host HOST -i IDENTITY [-u USER] LISTEN_ADDR\n")
+		fmt.Fprintf(os.Stderr, "Example: solbridge -host idrac.local -i ~/.ssh/idrac localhost:9119\n")
 		os.Exit(1)
 	}
 	listenAddr := flag.Arg(0)
