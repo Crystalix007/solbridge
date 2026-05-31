@@ -5,6 +5,7 @@
 //
 // Once running, `nc localhost 2300` connects you to the serial console.
 // Multiple concurrent nc sessions share the same SOL connection (output is broadcast).
+// Survives SSH session drops with exponential-backoff reconnection.
 
 package main
 
@@ -20,6 +21,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -60,118 +62,221 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", finalHost, finalPort)
 	log.Printf("connecting to iDRAC at %s (%s)", *sshHost, addr)
 
-	client, err := ssh.Dial("tcp", addr, sshConfig)
-	if err != nil {
-		log.Fatalf("ssh dial: %v", err)
-	}
-	defer client.Close()
-
-	session, err := client.NewSession()
-	if err != nil {
-		log.Fatalf("new session: %v", err)
-	}
-	defer session.Close()
-
-	// Request PTY — iDRAC needs a terminal for console com2.
-	modes := ssh.TerminalModes{
-		ssh.ECHO:  1,
-		ssh.IGNCR: 1,
-	}
-	if err := session.RequestPty("vt100", 80, 40, modes); err != nil {
-		log.Fatalf("request pty: %v", err)
-	}
-
-	solIn, err := session.StdinPipe()
-	if err != nil {
-		log.Fatalf("stdin pipe: %v", err)
-	}
-	solOut, err := session.StdoutPipe()
-	if err != nil {
-		log.Fatalf("stdout pipe: %v", err)
-	}
-
-	if err := session.Start("console com2"); err != nil {
-		log.Fatalf("start console com2: %v", err)
-	}
-	log.Printf("SOL session started — listening on %s", listenAddr)
-
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
+	log.Printf("listening on %s", listenAddr)
 
-	// Serialized writer for SOL stdin — prevents interleaving from concurrent clients.
-	inMu := new(sync.Mutex)
-	solInWriter := &lockedWriter{w: solIn, mu: inMu}
-
-	// Fan-out: broadcast SOL output to all connected TCP clients.
-	var (
-		mu      sync.Mutex
-		writers []io.Writer
-	)
-
-	// Read from SOL and broadcast to all connected TCP writers.
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := solOut.Read(buf)
-			if n > 0 {
-				mu.Lock()
-				active := writers[:0]
-				for _, w := range writers {
-					if _, werr := w.Write(buf[:n]); werr != nil {
-						continue
-					}
-					active = append(active, w)
-				}
-				writers = active
-				mu.Unlock()
-			}
-			if err != nil {
-				log.Printf("sol read done: %v", err)
-				return
-			}
-		}
-	}()
+	b := &bridge{
+		quit:  make(chan struct{}),
+		solIn: swappableWriter{w: io.Discard},
+	}
 
 	// Signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		log.Println("shutting down...")
+		close(b.quit)
 		ln.Close()
 	}()
+
+	go b.reconnectLoop(addr, sshConfig)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
-			continue
+			// Listener closed — exit.
+			break
 		}
 		log.Printf("client connected from %s", conn.RemoteAddr())
 
-		mu.Lock()
-		writers = append(writers, conn)
-		mu.Unlock()
+		b.mu.Lock()
+		b.writers = append(b.writers, conn)
+		b.mu.Unlock()
 
-		// Read from TCP client → write to SOL stdin.
+		// Read from TCP client → write to SOL stdin (swappable across reconnects).
 		go func(c net.Conn) {
 			defer c.Close()
-			io.Copy(solInWriter, c)
-			mu.Lock()
-			for i, w := range writers {
+			io.Copy(&b.solIn, c)
+			b.mu.Lock()
+			for i, w := range b.writers {
 				if w == c {
-					writers = append(writers[:i], writers[i+1:]...)
+					b.writers = append(b.writers[:i], b.writers[i+1:]...)
 					break
 				}
 			}
-			mu.Unlock()
+			b.mu.Unlock()
 			log.Printf("client disconnected from %s", c.RemoteAddr())
 		}(conn)
 	}
 }
+
+// bridge holds the shared state: connected TCP writers and the SOL stdin
+// writer, which is atomically swapped on reconnect.
+type bridge struct {
+	mu      sync.Mutex
+	writers []io.Writer
+	solIn   swappableWriter
+	quit    chan struct{}
+}
+
+// readSOL copies from r to all connected writers in 4 KB chunks.
+// Returns when r reaches EOF or error.
+func (b *bridge) readSOL(r io.Reader) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			b.mu.Lock()
+			active := b.writers[:0]
+			for _, w := range b.writers {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					continue
+				}
+				active = append(active, w)
+			}
+			b.writers = active
+			b.mu.Unlock()
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("SOL read error: %v", err)
+			}
+			return
+		}
+	}
+}
+
+// broadcastMsg sends a fixed string to all connected writers (best-effort).
+func (b *bridge) broadcastMsg(msg string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, w := range b.writers {
+		w.Write([]byte(msg))
+	}
+}
+
+// connectSOL dials SSH, creates a session, requests a PTY, starts
+// "console com2", and returns the stdin/stdout pipes and a shutdown
+// function that closes the session then the client.
+func connectSOL(addr string, sshConfig *ssh.ClientConfig) (shutdown func(), solIn io.WriteCloser, solOut io.Reader, err error) {
+	client, err := ssh.Dial("tcp", addr, sshConfig)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("ssh dial: %w", err)
+	}
+
+	session, err := client.NewSession()
+	if err != nil {
+		client.Close()
+		return nil, nil, nil, fmt.Errorf("new session: %w", err)
+	}
+
+	modes := ssh.TerminalModes{
+		ssh.ECHO:  1,
+		ssh.IGNCR: 1,
+	}
+	if err := session.RequestPty("vt100", 80, 40, modes); err != nil {
+		session.Close()
+		client.Close()
+		return nil, nil, nil, fmt.Errorf("request pty: %w", err)
+	}
+
+	if solIn, err = session.StdinPipe(); err != nil {
+		session.Close()
+		client.Close()
+		return nil, nil, nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	if solOut, err = session.StdoutPipe(); err != nil {
+		session.Close()
+		client.Close()
+		return nil, nil, nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	if err := session.Start("console com2"); err != nil {
+		session.Close()
+		client.Close()
+		return nil, nil, nil, fmt.Errorf("start console com2: %w", err)
+	}
+
+	shutdown = func() { session.Close(); client.Close() }
+	return shutdown, solIn, solOut, nil
+}
+
+// reconnectLoop dials iDRAC in a loop with exponential backoff, swapping
+// the solIn writer and reading SOL output while connected.
+func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
+	const minBackoff = 2 * time.Second
+	const maxBackoff = 30 * time.Second
+	delay := minBackoff
+
+	for {
+		select {
+		case <-b.quit:
+			return
+		default:
+		}
+
+		shutdown, solIn, solOut, err := connectSOL(addr, sshConfig)
+		if err != nil {
+			log.Printf("SOL connect failed: %v (retry in %v)", err, delay)
+			sleepUntil(b.quit, delay)
+			delay *= 2
+			if delay > maxBackoff {
+				delay = maxBackoff
+			}
+			continue
+		}
+
+		log.Printf("SOL connected")
+		b.solIn.Swap(solIn)
+
+		connectedAt := time.Now()
+		b.readSOL(solOut)
+
+		// Only reset backoff if the connection lasted a decent while.
+		// Quick drops (e.g. iDRAC "already in use") should keep backing off.
+		if time.Since(connectedAt) > 10*time.Second {
+			delay = minBackoff
+		} else {
+			delay *= 2
+			if delay > maxBackoff {
+				delay = maxBackoff
+			}
+		}
+
+		b.broadcastMsg("\r\n--- RECONNECTING ---\r\n")
+		shutdown()
+
+		log.Printf("reconnecting in %v", delay)
+		sleepUntil(b.quit, delay)
+	}
+}
+
+// swappableWriter wraps an io.Writer with a mutex so the underlying target
+// can be atomically replaced (during reconnect) while concurrent io.Copy
+// calls continue to write.
+type swappableWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (sw *swappableWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+func (sw *swappableWriter) Swap(w io.Writer) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.w = w
+}
+
+// --- helpers (unchanged) ---
 
 func expandPath(p string) string {
 	if len(p) >= 2 && p[:2] == "~/" {
@@ -297,14 +402,12 @@ func eqFold(a, b string) bool {
 	return true
 }
 
-// lockedWriter serializes writes with a mutex to prevent interleaving.
-type lockedWriter struct {
-	w  io.Writer
-	mu *sync.Mutex
-}
-
-func (lw *lockedWriter) Write(p []byte) (int, error) {
-	lw.mu.Lock()
-	defer lw.mu.Unlock()
-	return lw.w.Write(p)
+// sleepUntil sleeps for d or until quit is closed, whichever comes first.
+func sleepUntil(quit <-chan struct{}, d time.Duration) {
+	timer := time.NewTimer(d)
+	select {
+	case <-quit:
+		timer.Stop()
+	case <-timer.C:
+	}
 }
