@@ -10,7 +10,6 @@
 package main
 
 import (
-	"strings"
 	"bufio"
 	"flag"
 	"fmt"
@@ -21,6 +20,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -75,6 +75,8 @@ func main() {
 	defer ln.Close()
 	log.Printf("listening on %s", listenAddr)
 
+	var wg sync.WaitGroup
+
 	b := &bridge{
 		quit:  make(chan struct{}),
 		solIn: swappableWriter{w: io.Discard},
@@ -87,15 +89,21 @@ func main() {
 		<-sigCh
 		log.Println("shutting down...")
 		close(b.quit)
+		b.forceClose()
 		ln.Close()
 	}()
 
-	go b.reconnectLoop(addr, sshConfig)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.reconnectLoop(addr, sshConfig)
+	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Listener closed — exit.
+			// Listener closed — wait for reconnect loop to clean up, then exit.
+			wg.Wait()
 			break
 		}
 		log.Printf("client connected from %s", conn.RemoteAddr())
@@ -123,11 +131,31 @@ func main() {
 
 // bridge holds the shared state: connected TCP writers and the SOL stdin
 // writer, which is atomically swapped on reconnect.
+type shutdownFunc func()
+
 type bridge struct {
 	mu      sync.Mutex
 	writers []io.Writer
 	solIn   swappableWriter
 	quit    chan struct{}
+
+	shutdownMu sync.Mutex
+	shutdown   shutdownFunc // set by reconnectLoop, nil when not connected
+}
+
+func (b *bridge) forceClose() {
+	b.shutdownMu.Lock()
+	defer b.shutdownMu.Unlock()
+	if b.shutdown != nil {
+		b.shutdown()
+		b.shutdown = nil
+	}
+}
+
+func (b *bridge) setShutdown(f shutdownFunc) {
+	b.shutdownMu.Lock()
+	b.shutdown = f
+	b.shutdownMu.Unlock()
 }
 
 // readSOL copies from r to all connected writers in 4 KB chunks.
@@ -222,6 +250,7 @@ func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
 	for {
 		select {
 		case <-b.quit:
+			b.setShutdown(nil)
 			return
 		default:
 		}
@@ -238,6 +267,7 @@ func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
 		}
 
 		log.Printf("SOL connected")
+		b.setShutdown(shutdown)
 		b.solIn.Swap(solIn)
 
 		connectedAt := time.Now()
@@ -255,7 +285,7 @@ func (b *bridge) reconnectLoop(addr string, sshConfig *ssh.ClientConfig) {
 		}
 
 		b.broadcastMsg("\r\n--- RECONNECTING ---\r\n")
-		shutdown()
+		b.setShutdown(nil); shutdown()
 
 		log.Printf("reconnecting in %v", delay)
 		sleepUntil(b.quit, delay)
@@ -335,7 +365,7 @@ func resolveSSHConfig(host string) (string, int) {
 			case strings.EqualFold(key, "port"):
 				fmt.Sscanf(val, "%d", &resolvedPort)
 			}
-	}
+		}
 	}
 	return resolved, resolvedPort
 }
