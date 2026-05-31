@@ -10,6 +10,7 @@
 package main
 
 import (
+	"strings"
 	"bufio"
 	"flag"
 	"fmt"
@@ -313,98 +314,39 @@ func resolveSSHConfig(host string) (string, int) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		// Very simple parser — good enough for ~/.ssh/config.
-		trimmed := trimLeft(line)
-		if isHostDirective(trimmed) {
-			inHost = matchesHost(trimmed, host)
+		trimmed := strings.TrimLeft(line, " \t")
+		if len(trimmed) >= 5 && strings.EqualFold(trimmed[:5], "Host ") {
+			inHost = false
+			for _, pat := range strings.Fields(trimmed[5:]) {
+				if pat == host {
+					inHost = true
+					break
+				}
+			}
 			continue
 		}
 		if !inHost {
 			continue
 		}
-		if key, val := splitKV(trimmed); key != "" {
+		if key, val := sshKV(trimmed); key != "" {
 			switch {
-			case eqFold(key, "hostname"):
+			case strings.EqualFold(key, "hostname"):
 				resolved = val
-			case eqFold(key, "port"):
+			case strings.EqualFold(key, "port"):
 				fmt.Sscanf(val, "%d", &resolvedPort)
 			}
-		}
+	}
 	}
 	return resolved, resolvedPort
 }
 
-func trimLeft(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
+// sshKV splits "Key value" or "Key=value" into key and value.
+func sshKV(s string) (string, string) {
+	i := strings.IndexAny(s, " \t=")
+	if i < 0 {
+		return s, ""
 	}
-	return s
-}
-
-func splitKV(s string) (string, string) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' || s[i] == '=' {
-			key := s[:i]
-			// skip whitespace/equals
-			for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '=') {
-				i++
-			}
-			return key, s[i:]
-		}
-	}
-	return s, ""
-}
-
-func isHostDirective(line string) bool {
-	return len(line) >= 5 && (line[:5] == "Host " || line[:5] == "host ")
-}
-
-func matchesHost(line, target string) bool {
-	// Parse space-separated patterns after "Host ".
-	rest := line[5:]
-	for _, pat := range splitFields(rest) {
-		if pat == target {
-			return true
-		}
-	}
-	return false
-}
-
-func splitFields(s string) []string {
-	var fields []string
-	start := -1
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' {
-			if start >= 0 {
-				fields = append(fields, s[start:i])
-				start = -1
-			}
-		} else if start < 0 {
-			start = i
-		}
-	}
-	if start >= 0 {
-		fields = append(fields, s[start:])
-	}
-	return fields
-}
-
-func eqFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
+	return s[:i], strings.TrimLeft(s[i+1:], " \t=")
 }
 
 // sleepUntil sleeps for d or until quit is closed, whichever comes first.
